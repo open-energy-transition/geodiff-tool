@@ -87,5 +87,68 @@ out skel qt;
 
 This file can be used directly as input to the script.
 
+### Example: All hydro power plants and generators across the globe
 
+```overpass
+[out:json][timeout:900];
+(
+  /* Hydropower plants */
+  node["power"="plant"]["plant:source"~"hydro|water"];
+  way["power"="plant"]["plant:source"~"hydro|water"];
+  relation["power"="plant"]["plant:source"~"hydro|water"];
 
+  /* Explicit generators */
+  node["power"="generator"]["generator:source"~"hydro|water"];
+  way["power"="generator"]["generator:source"~"hydro|water"];
+  relation["power"="generator"]["generator:source"~"hydro|water"];
+
+  /* Waterway-embedded turbines / generators */
+  node["generator:method"="water-turbine"];
+  way["generator:method"="water-turbine"];
+  relation["generator:method"="water-turbine"];
+
+  node["turbine:type"];
+  way["turbine:type"];
+  relation["turbine:type"];
+);
+out center tags;
+
+```
+
+### Example: All power plants with battery storage included
+
+```overpass
+/*
+  Overpass Turbo query — Battery storage POWER PLANTS worldwide
+  Includes only power=plant features
+  Excludes all power=generator features
+*/
+
+[out:json][timeout:900][maxsize:1073741824];
+
+(
+  /* power=plant with battery-related source tags */
+
+  // plant:source=battery
+  node["power"="plant"]["plant:source"~"(?i)battery"];
+  way["power"="plant"]["plant:source"~"(?i)battery"];
+  relation["power"="plant"]["plant:source"~"(?i)battery"];
+
+  // generator:source=battery (applied to the plant object itself)
+  node["power"="plant"]["generator:source"~"(?i)battery"];
+  way["power"="plant"]["generator:source"~"(?i)battery"];
+  relation["power"="plant"]["generator:source"~"(?i)battery"];
+
+  // source=battery (generic, but sometimes used)
+  node["power"="plant"]["source"~"(?i)battery"];
+  way["power"="plant"]["source"~"(?i)battery"];
+  relation["power"="plant"]["source"~"(?i)battery"];
+
+  // direct power=battery plant tagging (rare)
+  node["power"="battery"];
+  way["power"="battery"];
+  relation["power"="battery"];
+);
+
+out tags center geom;
+```
