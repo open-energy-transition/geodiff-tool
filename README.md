@@ -152,3 +152,29 @@ out center tags;
 
 out tags center geom;
 ```
+### Example: A list of all power plants with names but no WikiData entry for a country of your choice. 
+
+```overpass
+/*
+  Power plants in a given country that:
+  - are tagged power=plant
+  - have a name
+  - do NOT have wikidata
+  Replace the COUNTRY value below.
+*/
+
+[out:json][timeout:180];
+
+// --- set your country name here ---
+{{geocodeArea:COUNTRY}}->.searchArea;
+
+// Power plants as nodes/ways/relations
+(
+  nwr["power"="plant"]["name"](area.searchArea);
+)->.plants_named;
+
+// Exclude anything that already has wikidata
+(.plants_named; - nwr["power"="plant"]["name"]["wikidata"](area.searchArea);)->.result;
+
+// Output
+.result out tags center;
