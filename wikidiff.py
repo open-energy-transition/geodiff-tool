@@ -4,12 +4,14 @@ Name-only OSM → Wikidata matcher.
 
 Features:
   - Searches in BOTH:
-      1) local Wikidata language auto mode (no explicit language parameter)
+      1) default Wikidata language behavior (no explicit language/uselang)
       2) English ("en") fallback
   - Accept ONLY entities whose P31 ("instance of") intersects ALLOWED_P31_QIDS
   - Output ONLY accepted matches
   - Print matches to screen
   - Progress bar support (tqdm)
+  - Robust retry/backoff that waits and continues after transient network errors
+    (including requests.exceptions.ReadTimeout)
 
 Install:
   pip install requests tqdm
@@ -19,13 +21,20 @@ Usage:
       --input input.geojson \
       --output matched_only.geojson \
       --max-hits 5 \
-      --sleep-s 0.05
+      --sleep-s 0.05 \
+      --timeout-s 30 \
+      --max-retries 0
+
+Notes:
+  - By default, --max-retries 0 means "retry forever" on transient errors.
+  - Backoff uses exponential growth with jitter and caps at --backoff-cap-s.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -53,29 +62,126 @@ ALLOWED_P31_QIDS = {
 }
 
 
-def wd_api_get(session: requests.Session, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = session.get(WIKIDATA_API, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def is_transient_requests_error(exc: Exception) -> bool:
+    # Network/timeouts/temporary DNS issues/etc.
+    transient_types = (
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.ConnectTimeout,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+        requests.exceptions.ContentDecodingError,
+    )
+    if isinstance(exc, transient_types):
+        return True
+    return False
 
 
-def wbsearchentities(session: requests.Session, query: str, language: Optional[str], limit: int):
+def is_retryable_http_status(status_code: int) -> bool:
+    # Common transient server-side or rate-limit statuses
+    return status_code in (429, 500, 502, 503, 504)
+
+
+def sleep_backoff(attempt: int, base_s: float, cap_s: float) -> None:
+    """
+    Exponential backoff with jitter:
+      sleep = min(cap, base * 2^(attempt-1)) * random(0.5..1.5)
+    """
+    exp = base_s * (2 ** max(0, attempt - 1))
+    exp = min(cap_s, exp)
+    jitter = random.uniform(0.5, 1.5)
+    time.sleep(exp * jitter)
+
+
+def wd_api_get(
+    session: requests.Session,
+    params: Dict[str, Any],
+    timeout_s: float,
+    max_retries: int,          # 0 => infinite
+    backoff_base_s: float,
+    backoff_cap_s: float,
+) -> Dict[str, Any]:
+    """
+    Robust GET with retry/backoff:
+      - Retries forever by default on transient network errors and retryable HTTP statuses.
+      - Prints a short message when backing off.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = session.get(WIKIDATA_API, params=params, timeout=timeout_s)
+
+            # Retry on certain HTTP status codes
+            if is_retryable_http_status(r.status_code):
+                msg = f"HTTP {r.status_code} from Wikidata API"
+                raise requests.exceptions.HTTPError(msg, response=r)
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            retryable = status is not None and is_retryable_http_status(status)
+            if not retryable:
+                raise
+
+            if max_retries != 0 and attempt > max_retries:
+                raise
+
+            print(f"[WARN] {e}. Backing off and retrying (attempt {attempt})...")
+            sleep_backoff(attempt, backoff_base_s, backoff_cap_s)
+
+        except Exception as e:
+            if not is_transient_requests_error(e):
+                raise
+
+            if max_retries != 0 and attempt > max_retries:
+                raise
+
+            print(f"[WARN] Transient error: {type(e).__name__}: {e}")
+            print(f"       Backing off and retrying (attempt {attempt})...")
+            sleep_backoff(attempt, backoff_base_s, backoff_cap_s)
+
+
+def wbsearchentities(
+    session: requests.Session,
+    query: str,
+    language: Optional[str],
+    limit: int,
+    timeout_s: float,
+    max_retries: int,
+    backoff_base_s: float,
+    backoff_cap_s: float,
+) -> List[Dict[str, Any]]:
     params = {
         "action": "wbsearchentities",
         "search": query,
         "limit": limit,
         "format": "json",
     }
-
-    # If language is None, we do not send language/uselang at all.
     if language is not None:
         params["language"] = language
         params["uselang"] = language
 
-    return wd_api_get(session, params).get("search", [])
+    data = wd_api_get(
+        session=session,
+        params=params,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        backoff_base_s=backoff_base_s,
+        backoff_cap_s=backoff_cap_s,
+    )
+    return data.get("search", []) or []
 
 
-def wbgetentities_p31(session: requests.Session, qids: List[str]) -> Dict[str, List[str]]:
+def wbgetentities_p31(
+    session: requests.Session,
+    qids: List[str],
+    timeout_s: float,
+    max_retries: int,
+    backoff_base_s: float,
+    backoff_cap_s: float,
+) -> Dict[str, List[str]]:
     if not qids:
         return {}
 
@@ -86,32 +192,40 @@ def wbgetentities_p31(session: requests.Session, qids: List[str]) -> Dict[str, L
         "format": "json",
     }
 
-    data = wd_api_get(session, params)
-    entities = data.get("entities", {})
+    data = wd_api_get(
+        session=session,
+        params=params,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        backoff_base_s=backoff_base_s,
+        backoff_cap_s=backoff_cap_s,
+    )
+    entities = data.get("entities", {}) or {}
 
-    result = {}
+    result: Dict[str, List[str]] = {}
     for qid, entity in entities.items():
-        claims = entity.get("claims", {})
-        p31_claims = claims.get("P31", [])
+        claims = (entity or {}).get("claims", {}) or {}
+        p31_claims = claims.get("P31", []) or []
 
-        p31_values = []
+        p31_values: List[str] = []
         for claim in p31_claims:
             try:
                 val = claim["mainsnak"]["datavalue"]["value"]
                 if val.get("entity-type") == "item":
                     pid = val.get("id")
-                    if pid:
+                    if isinstance(pid, str) and pid.startswith("Q"):
                         p31_values.append(pid)
             except Exception:
                 continue
 
-        result[qid] = list(set(p31_values))
+        # de-dup
+        result[qid] = sorted(set(p31_values))
 
     return result
 
 
 def get_osm_name(feature: Dict[str, Any]) -> Optional[str]:
-    props = feature.get("properties", {})
+    props = feature.get("properties", {}) or {}
 
     if isinstance(props.get("name"), str) and props["name"].strip():
         return props["name"].strip()
@@ -130,6 +244,10 @@ def find_match(
     osm_name: str,
     limit: int,
     sleep_s: float,
+    timeout_s: float,
+    max_retries: int,
+    backoff_base_s: float,
+    backoff_cap_s: float,
 ) -> Optional[Dict[str, Any]]:
     """
     Tries:
@@ -137,33 +255,54 @@ def find_match(
       2) wbsearchentities in English
     Accepts first hit whose P31 intersects ALLOWED_P31_QIDS.
     """
-
-    # 1) default language search (no language/uselang params)
-    hits = wbsearchentities(session, osm_name, language=None, limit=limit)
+    hits = wbsearchentities(
+        session=session,
+        query=osm_name,
+        language=None,
+        limit=limit,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        backoff_base_s=backoff_base_s,
+        backoff_cap_s=backoff_cap_s,
+    )
     if sleep_s:
         time.sleep(sleep_s)
 
-    # 2) fallback: english
     if not hits:
-        hits = wbsearchentities(session, osm_name, language="en", limit=limit)
+        hits = wbsearchentities(
+            session=session,
+            query=osm_name,
+            language="en",
+            limit=limit,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            backoff_base_s=backoff_base_s,
+            backoff_cap_s=backoff_cap_s,
+        )
         if sleep_s:
             time.sleep(sleep_s)
 
     if not hits:
         return None
 
-    qids = [h["id"] for h in hits if h.get("id", "").startswith("Q")]
+    qids = [h.get("id") for h in hits if isinstance(h.get("id"), str) and h["id"].startswith("Q")]
     if not qids:
         return None
 
-    p31_map = wbgetentities_p31(session, qids)
+    p31_map = wbgetentities_p31(
+        session=session,
+        qids=qids,
+        timeout_s=timeout_s,
+        max_retries=max_retries,
+        backoff_base_s=backoff_base_s,
+        backoff_cap_s=backoff_cap_s,
+    )
     if sleep_s:
         time.sleep(sleep_s)
 
-    # Iterate in search ranking order
     for hit in hits:
         qid = hit.get("id")
-        if not qid:
+        if not (isinstance(qid, str) and qid.startswith("Q")):
             continue
 
         instance_of = p31_map.get(qid, [])
@@ -178,27 +317,47 @@ def find_match(
     return None
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--max-hits", type=int, default=5)
-    ap.add_argument("--sleep-s", type=float, default=0.40)
+    ap.add_argument("--sleep-s", type=float, default=0.05)
+
+    # Retry/backoff controls
+    ap.add_argument("--timeout-s", type=float, default=30.0, help="HTTP timeout per request (default: 30)")
+    ap.add_argument(
+        "--max-retries",
+        type=int,
+        default=0,
+        help="Max retries for transient errors (0 = retry forever; default: 0)",
+    )
+    ap.add_argument("--backoff-base-s", type=float, default=2.0, help="Backoff base seconds (default: 2)")
+    ap.add_argument("--backoff-cap-s", type=float, default=120.0, help="Max backoff seconds (default: 120)")
+
+    ap.add_argument(
+        "--user-agent",
+        default="osm-wikidata-name-instance-filter/1.2 (contact: you@example.com)",
+        help="User-Agent string for polite Wikidata API usage",
+    )
     args = ap.parse_args()
 
     with open(args.input, "r", encoding="utf-8") as f:
         gj = json.load(f)
 
+    if not isinstance(gj, dict) or gj.get("type") != "FeatureCollection":
+        raise SystemExit("Input must be a GeoJSON FeatureCollection.")
+
     features = gj.get("features", [])
+    if not isinstance(features, list):
+        raise SystemExit("GeoJSON FeatureCollection.features must be a list.")
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "osm-wikidata-name-instance-filter/1.1"
-    })
+    session.headers.update({"User-Agent": args.user_agent})
 
-    out_features = []
+    out_features: List[Dict[str, Any]] = []
 
-    iterator = tqdm(features, desc="Matching") if tqdm else features
+    iterator = tqdm(features, desc="Matching ") if tqdm else features
 
     for feat in iterator:
         osm_name = get_osm_name(feat)
@@ -210,6 +369,10 @@ def main():
             osm_name=osm_name,
             limit=args.max_hits,
             sleep_s=args.sleep_s,
+            timeout_s=args.timeout_s,
+            max_retries=args.max_retries,
+            backoff_base_s=args.backoff_base_s,
+            backoff_cap_s=args.backoff_cap_s,
         )
 
         if not match:
@@ -225,10 +388,7 @@ def main():
 
         print(f"[MATCH] {osm_name} → {match['qid']} ({match['label']})")
 
-    output = {
-        "type": "FeatureCollection",
-        "features": out_features,
-    }
+    output = {"type": "FeatureCollection", "features": out_features}
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
