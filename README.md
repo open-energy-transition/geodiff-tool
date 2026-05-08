@@ -178,3 +178,15 @@ out tags center geom;
 
 // Output
 .result out tags center;
+```
+
+### Example: Get all the wind turbines.
+
+```overpass
+[out:json][timeout:2000];
+(
+  node["power"="generator"]["generator:source"="wind"];
+  node["power"="generator"]["generator:method"="wind_turbine"];
+);
+``
+out center tags;
