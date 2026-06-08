@@ -1,12 +1,7 @@
-import sys
+import argparse
 import os
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point
-from shapely.ops import unary_union
-from tqdm import tqdm
-
-tqdm.pandas()
 
 # ------------------------
 # Utilities
@@ -50,10 +45,8 @@ def load_csv_as_gdf(path):
 
     lat_col, lon_col = detect_lat_lon_columns(df)
 
-    geometry = [
-        Point(xy)
-        for xy in zip(df[lon_col], df[lat_col])
-    ]
+    # Vectorised point construction (avoids a per-row Python loop).
+    geometry = gpd.points_from_xy(df[lon_col], df[lat_col])
 
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
     return gdf
@@ -79,45 +72,93 @@ def load_and_project(path):
 
     return gdf.to_crs(epsg=3857)
 
+
+def load_region(path):
+    """
+    Load a GeoJSON describing one or more regions and return a single
+    (dissolved) geometry in EPSG:3857 to use as a spatial mask.
+    """
+    print(f"Loading region: {path}")
+    region = gpd.read_file(path)
+
+    if region.empty:
+        raise ValueError(f"Region file {path} is empty")
+
+    if region.crs is None:
+        region = region.set_crs(epsg=4326)
+
+    region = region.to_crs(epsg=3857)
+
+    # Merge all region features into one geometry so a feature counts as
+    # "inside" if it falls within any of them.
+    return region.geometry.union_all()
+
+
+def clip_to_region(gdf, region_geom, label):
+    """
+    Keep only the features of ``gdf`` that fall inside ``region_geom``.
+    Uses a spatial-index-backed predicate so it stays fast on large inputs.
+    """
+    before = len(gdf)
+    kept = gdf[gdf.intersects(region_geom)]
+    print(f"  {label}: {before} features → {len(kept)} inside region")
+    return kept
+
 # ------------------------
 # Spatial logic
 # ------------------------
 
-def build_buffer_union(gdf, radius_m, label):
-    print(f"Buffering geometries for {label}...")
-    buffered = [
-        geom.buffer(radius_m)
-        for geom in tqdm(gdf.geometry, desc=f"Buffering {label}")
-    ]
-    return unary_union(buffered)
-
-
 def spatial_diff(gdf_a, gdf_b, radius_km, label_a, label_b):
-    radius_m = km_to_meters(radius_km)
+    """
+    Return the features of A that lie further than ``radius_km`` from every
+    feature of B.
 
-    buffered_b_union = build_buffer_union(
-        gdf_b, radius_m, label_b
+    Instead of buffering all of B and unioning it into one giant geometry
+    (O(n) buffers + an expensive union, then a brute-force intersects scan),
+    we run a bounded nearest-neighbour join. ``sjoin_nearest`` builds an
+    STRtree spatial index over B and resolves every A feature against it in
+    vectorised C code, so no buffer or union is ever materialised.
+    """
+    radius_m = km_to_meters(radius_km)
+    print(
+        f"Computing diff: {label_a} minus {label_b} "
+        f"(radius {radius_km} km)..."
     )
 
-    print(f"Computing diff: {label_a} minus {label_b}...")
-    keep_mask = []
+    # Positional index so we can cleanly drop matched rows regardless of the
+    # original index's uniqueness.
+    gdf_a = gdf_a.reset_index(drop=True)
 
-    for geom in tqdm(
-        gdf_a.geometry,
-        desc=f"Comparing {label_a} → {label_b}"
-    ):
-        keep_mask.append(not geom.intersects(buffered_b_union))
+    # Only geometry is needed from B; max_distance bounds the search radius.
+    joined = gpd.sjoin_nearest(
+        gdf_a,
+        gdf_b[["geometry"]],
+        max_distance=radius_m,
+        how="inner",
+    )
+    matched = joined.index.unique()
 
-    return gdf_a[keep_mask]
+    kept = gdf_a.drop(index=matched)
+    print(
+        f"  {label_a}: {len(gdf_a)} features → {len(kept)} kept "
+        f"({len(matched)} within {radius_km} km of {label_b})"
+    )
+    return kept
 
 # ------------------------
 # Main
 # ------------------------
 
-def main(a_path, b_path, radius_km, out_a):
+def main(a_path, b_path, radius_km, out_a, region_path=None):
     print("Loading inputs...")
     gdf_a = load_and_project(a_path)
     gdf_b = load_and_project(b_path)
+
+    if region_path:
+        region_geom = load_region(region_path)
+        print("Clipping inputs to region...")
+        gdf_a = clip_to_region(gdf_a, region_geom, "A")
+        gdf_b = clip_to_region(gdf_b, region_geom, "B")
 
     a_minus_b = spatial_diff(
         gdf_a, gdf_b, radius_km, "A", "B"
@@ -134,17 +175,32 @@ def main(a_path, b_path, radius_km, out_a):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
-        print(
-            "Usage:\n"
-            "  python geojson_diff.py <a.(geojson|csv)> <b.(geojson|csv)> "
-            "<radius_km> <a_minus_b.geojson>"
+    parser = argparse.ArgumentParser(
+        description=(
+            "Return the features of A that lie further than <radius_km> "
+            "from every feature of B."
         )
-        sys.exit(1)
+    )
+    parser.add_argument("a_path", help="A input (.geojson or .csv)")
+    parser.add_argument("b_path", help="B input (.geojson or .csv)")
+    parser.add_argument("radius_km", type=float, help="match radius in km")
+    parser.add_argument("out_a", help="output GeoJSON (A minus B)")
+    parser.add_argument(
+        "--region",
+        dest="region_path",
+        default=None,
+        help=(
+            "optional GeoJSON of one or more regions; the diff is only "
+            "performed within these regions (features of A and B outside "
+            "are ignored)"
+        ),
+    )
+    args = parser.parse_args()
 
-    a_path = sys.argv[1]
-    b_path = sys.argv[2]
-    radius_km = float(sys.argv[3])
-    out_a = sys.argv[4]
-
-    main(a_path, b_path, radius_km, out_a)
+    main(
+        args.a_path,
+        args.b_path,
+        args.radius_km,
+        args.out_a,
+        region_path=args.region_path,
+    )
