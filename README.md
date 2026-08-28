@@ -50,19 +50,8 @@ Each row is converted into a Point geometry.
 
 ---
 
-## Usage
-
 ```bash
-python geodiff.py <a_input> <b_input> [radius_km] <output>
-```
-
-`radius_km` is optional and defaults to `1`. The output format follows its
-extension: `.shp` writes a shapefile, `.gpkg` a GeoPackage, anything else
-GeoJSON.
-
-### Examples
-
-```bash
+pip install -r requirements.txt
 python geodiff.py substations.csv substations.geojson 1 result.geojson
 ```
 
