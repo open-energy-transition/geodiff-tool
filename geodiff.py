@@ -3,6 +3,8 @@ import os
 import pandas as pd
 import geopandas as gpd
 
+DEFAULT_RADIUS_KM = 1.0
+
 # ------------------------
 # Utilities
 # ------------------------
@@ -52,6 +54,69 @@ def load_csv_as_gdf(path):
     return gdf
 
 
+# A shapefile is a set of sibling files, not one file. Only the .shp is
+# strictly geometry; the rest carry the index, attributes and CRS.
+SHAPEFILE_SIDECARS = (".shx", ".dbf", ".prj")
+
+
+def missing_shapefile_sidecars(path):
+    """
+    Return the sidecar extensions that are absent next to ``path``.
+    Extensions are matched case-insensitively, since shapefiles are often
+    shipped with upper-case suffixes.
+    """
+    stem = os.path.splitext(path)[0]
+    return [
+        ext
+        for ext in SHAPEFILE_SIDECARS
+        if not (os.path.exists(stem + ext) or os.path.exists(stem + ext.upper()))
+    ]
+
+
+def prepare_shapefile(path):
+    """
+    Make a possibly-incomplete shapefile readable and say out loud what is
+    degraded, so a partial dataset never loads silently.
+    """
+    missing = missing_shapefile_sidecars(path)
+    if not missing:
+        return
+
+    print(f"  incomplete shapefile, missing: {', '.join(missing)}")
+
+    if ".shx" in missing:
+        # Without an index GDAL refuses to open the .shp at all. This config
+        # option makes it rebuild the index from the geometry records instead.
+        os.environ["SHAPE_RESTORE_SHX"] = "YES"
+        print("  → rebuilding the .shx index from the geometry records")
+    if ".dbf" in missing:
+        print("  → no attribute table; geometries load without properties")
+    # A missing .prj needs no action here: read_vector reports and fills in
+    # the CRS for any file that does not declare one.
+
+
+def read_vector(path):
+    """
+    Read any vector format GeoPandas supports, filling in the CRS when the
+    file does not declare one.
+    """
+    print(f"Loading vector file: {path}")
+
+    if os.path.splitext(path)[1].lower() == ".shp":
+        prepare_shapefile(path)
+
+    gdf = gpd.read_file(path)
+
+    if gdf.empty:
+        raise ValueError(f"{path} is empty")
+
+    if gdf.crs is None:
+        print(f"  {path} declares no CRS; assuming EPSG:4326")
+        gdf = gdf.set_crs(epsg=4326)
+
+    return gdf
+
+
 def load_and_project(path):
     """
     Load GeoJSON / Shapefile / CSV and project to EPSG:3857
@@ -61,33 +126,18 @@ def load_and_project(path):
     if ext == ".csv":
         gdf = load_csv_as_gdf(path)
     else:
-        print(f"Loading vector file: {path}")
-        gdf = gpd.read_file(path)
-
-        if gdf.empty:
-            raise ValueError(f"{path} is empty")
-
-        if gdf.crs is None:
-            gdf = gdf.set_crs(epsg=4326)
+        gdf = read_vector(path)
 
     return gdf.to_crs(epsg=3857)
 
 
 def load_region(path):
     """
-    Load a GeoJSON describing one or more regions and return a single
+    Load a vector file describing one or more regions and return a single
     (dissolved) geometry in EPSG:3857 to use as a spatial mask.
     """
     print(f"Loading region: {path}")
-    region = gpd.read_file(path)
-
-    if region.empty:
-        raise ValueError(f"Region file {path} is empty")
-
-    if region.crs is None:
-        region = region.set_crs(epsg=4326)
-
-    region = region.to_crs(epsg=3857)
+    region = read_vector(path).to_crs(epsg=3857)
 
     # Merge all region features into one geometry so a feature counts as
     # "inside" if it falls within any of them.
@@ -146,6 +196,21 @@ def spatial_diff(gdf_a, gdf_b, radius_km, label_a, label_b):
     return kept
 
 # ------------------------
+# Output
+# ------------------------
+
+def driver_for(path):
+    """
+    Pick the OGR driver from the output extension so the tool can write a
+    shapefile as readily as it reads one. Anything unrecognised stays
+    GeoJSON, which is the historical default.
+    """
+    return {
+        ".shp": "ESRI Shapefile",
+        ".gpkg": "GPKG",
+    }.get(os.path.splitext(path)[1].lower(), "GeoJSON")
+
+# ------------------------
 # Main
 # ------------------------
 
@@ -167,8 +232,9 @@ def main(a_path, b_path, radius_km, out_a, region_path=None):
     print("Reprojecting output to WGS84...")
     a_minus_b = a_minus_b.to_crs(epsg=4326)
 
-    print("Writing GeoJSON output...")
-    a_minus_b.to_file(out_a, driver="GeoJSON")
+    driver = driver_for(out_a)
+    print(f"Writing {driver} output...")
+    a_minus_b.to_file(out_a, driver=driver)
 
     print("\nDone!")
     print(f"  {out_a}")
@@ -181,16 +247,25 @@ if __name__ == "__main__":
             "from every feature of B."
         )
     )
-    parser.add_argument("a_path", help="A input (.geojson or .csv)")
-    parser.add_argument("b_path", help="B input (.geojson or .csv)")
-    parser.add_argument("radius_km", type=float, help="match radius in km")
-    parser.add_argument("out_a", help="output GeoJSON (A minus B)")
+    parser.add_argument("a_path", help="A input (.geojson, .shp, .gpkg or .csv)")
+    parser.add_argument("b_path", help="B input (.geojson, .shp, .gpkg or .csv)")
+    parser.add_argument(
+        "radius_km",
+        type=float,
+        nargs="?",
+        default=DEFAULT_RADIUS_KM,
+        help=f"match radius in km (default: {DEFAULT_RADIUS_KM})",
+    )
+    parser.add_argument(
+        "out_a",
+        help="output path, A minus B (.geojson, .shp or .gpkg)",
+    )
     parser.add_argument(
         "--region",
         dest="region_path",
         default=None,
         help=(
-            "optional GeoJSON of one or more regions; the diff is only "
+            "optional vector file of one or more regions; the diff is only "
             "performed within these regions (features of A and B outside "
             "are ignored)"
         ),

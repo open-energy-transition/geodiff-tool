@@ -1,5 +1,5 @@
 
-# geodiff - A Spatial Difference Tool (GeoJSON / CSV)
+# geodiff - A Spatial Difference Tool (GeoJSON / Shapefile / CSV)
 
 This script computes a spatial difference between two geospatial datasets.
 It keeps features from dataset **A** that are **not within a given radius** of any feature in dataset **B**.
@@ -14,8 +14,27 @@ It supports:
 ### Vector files
 
 * GeoJSON
-* Shapefile
+* Shapefile (`.shp`)
+* GeoPackage (`.gpkg`)
 * Any format readable by `geopandas.read_file()`
+
+#### Incomplete shapefiles
+
+A shapefile is a set of sibling files. If the companions of a `.shp` are
+missing, the tool reports what is absent and carries on where it can:
+
+| Missing | Effect |
+| --- | --- |
+| `.shx` | The index is rebuilt from the geometry records. |
+| `.dbf` | Geometries load without attributes. |
+| `.prj` | The CRS defaults to EPSG:4326. |
+
+Without this, GeoPandas refuses to open an unindexed `.shp` outright:
+
+```
+Unable to open substation_2025.shx or substation_2025.SHX.
+Set SHAPE_RESTORE_SHX config option to YES to restore or create it.
+```
 
 ### CSV files
 
@@ -34,16 +53,26 @@ Each row is converted into a Point geometry.
 ## Usage
 
 ```bash
-python geojson_diff.py <a_input> <b_input> <radius_km> <output.geojson>
+python geodiff.py <a_input> <b_input> [radius_km] <output>
 ```
 
-### Example
+`radius_km` is optional and defaults to `1`. The output format follows its
+extension: `.shp` writes a shapefile, `.gpkg` a GeoPackage, anything else
+GeoJSON.
+
+### Examples
 
 ```bash
-python geojson_diff.py substations.csv substations.geojson 1 result.geojson
+python geodiff.py substations.csv substations.geojson 1 result.geojson
 ```
 
-This keeps points from `substations.csv` that are more than 1 km away from any feature in `cities.geojson`.
+This keeps points from `substations.csv` that are more than 1 km away from any feature in `substations.geojson`.
+
+```bash
+python geodiff.py substation_2025.shp china-substation.geojson missing.geojson
+```
+
+Shapefile in, GeoJSON out, at the default 1 km radius.
 
 ---
 
