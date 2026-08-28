@@ -34,13 +34,14 @@ Each row is converted into a Point geometry.
 ## Usage
 
 ```bash
-python geojson_diff.py <a_input> <b_input> <radius_km> <output.geojson>
+pip install -r requirements.txt
+python geodiff.py <a_input> <b_input> <radius_km> <output.geojson>
 ```
 
 ### Example
 
 ```bash
-python geojson_diff.py substations.csv substations.geojson 1 result.geojson
+python geodiff.py substations.csv substations.geojson 1 result.geojson
 ```
 
 This keeps points from `substations.csv` that are more than 1 km away from any feature in `cities.geojson`.
