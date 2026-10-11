@@ -206,5 +206,35 @@ out tags center geom;
   node["power"="generator"]["generator:source"="wind"];
   node["power"="generator"]["generator:method"="wind_turbine"];
 );
-``
+
 out center tags;
+```
+
+# Example: All PV in India
+
+```overpass
+[out:json][timeout:900];
+
+// Define India
+area["ISO3166-1"="IN"]["admin_level"="2"]->.india;
+
+// Find photovoltaic installations
+(
+  // Solar power plants
+  nwr["power"="plant"]["plant:source"="solar"]
+     ["plant:method"!="thermal"](area.india);
+
+  // Solar generators
+  nwr["power"="generator"]["generator:source"="solar"]
+     ["generator:method"!="thermal"](area.india);
+
+  // Explicitly tagged photovoltaic generators
+  nwr["generator:method"="photovoltaic"](area.india);
+
+  // Solar photovoltaic panels
+  nwr["generator:type"="solar_photovoltaic_panel"](area.india);
+);
+
+// Return geometry and tags
+out geom;
+```
